@@ -1,13 +1,19 @@
 import numpy as np
 import math
-import os
-import atexit
+import matplotlib as mpl # Used to fix the 'k' key crash bug
 
 def controller(state, target_pos, dt, wind_enabled=False):
     # ==============================================================
     # 0. Ultimate anti-crash patch & baseline safety protection
     # ==============================================================
-   
+    # Fix the Matplotlib Bug where the 'k' key triggers a log-scale crash
+    if not hasattr(controller, 'hotkey_fixed'):
+        if 'k' in mpl.rcParams['keymap.xscale']:
+            mpl.rcParams['keymap.xscale'].remove('k')
+        if 'l' in mpl.rcParams['keymap.yscale']:
+            mpl.rcParams['keymap.yscale'].remove('l')
+        controller.hotkey_fixed = True
+
     # Safety check for initial zero dt
     if dt <= 1e-5:
         return (0.0, 0.0, 0.0, 0.0)
@@ -22,6 +28,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
     # [Outer Loop: Position -> Target Velocity] 
     # (Controls speed to target, resists steady wind)
     Kp_outer = np.array([1.2, 1.2, 1.0]) 
+    
     # [Optimization] Moved the anti-wind I term to the outer loop to 
     # truly eliminate steady-state error ("blown away and can't return")
     Ki_outer = np.array([0.5, 0.5, 0.5]) if wind_enabled else np.array([0.0, 0.0, 0.0])
@@ -32,38 +39,6 @@ def controller(state, target_pos, dt, wind_enabled=False):
     Kp_inner = np.array([0.8, 0.8, 0.8])
     Ki_inner = np.array([0.0, 0.0, 0.0]) # Inner loop integral set to 0 to prevent loops from fighting
     Kd_inner = np.array([0.05, 0.05, 0.05]) # Kept your D term, but paired it with the filter below
-
-    # ==============================================================
-    # 🌟 数据记录模块 (Data Logging Module)
-    # ==============================================================
-    if not hasattr(controller, "is_initialized_csv"):
-        controller.buffer = []
-        controller.buffer_limit = 50     # 满50条写入一次，防卡顿 / Write every 50 frames
-        controller.file_path = "data.csv"
-        controller.sim_time = 0.0        # 记录模拟器时间 / Track sim time
-        
-        # 第一次运行写入表头 / Write header on first run
-        if not os.path.exists(controller.file_path):
-            with open(controller.file_path, 'w') as f:
-                f.write("time,target_x,target_y,target_z,target_yaw,x,y,z,yaw\n")
-        
-        # 退出时保存最后的数据 / Save remaining data on exit
-        def flush_buffer():
-            if hasattr(controller, "buffer") and controller.buffer:
-                with open(controller.file_path, 'a') as f:
-                    f.writelines(controller.buffer)
-        atexit.register(flush_buffer)
-        controller.is_initialized_csv = True
-
-    # 累加时间并记录 / Accumulate time and record
-    controller.sim_time += dt
-    record = f"{controller.sim_time:.4f},{tx:.4f},{ty:.4f},{tz:.4f},{tyaw:.4f},{x:.4f},{y:.4f},{z:.4f},{yaw:.4f}\n"
-    controller.buffer.append(record)
-
-    if len(controller.buffer) >= controller.buffer_limit:
-        with open(controller.file_path, 'a') as f:
-            f.writelines(controller.buffer)
-        controller.buffer.clear()
 
     # ==============================================================
     # 3. Initialize persistent variables

@@ -1,20 +1,33 @@
-import numpy as np
+wind_flag = True
+# Implement a controller
+
 import math
 import os
 import atexit
 
 def controller(state, target_pos, dt, wind_enabled=False):
-
-    # 0. 安全保护 / Safety check for initial zero dt
-    if dt <= 1e-5:
+    """
+    完整 PID 控制器 (带数据记录与防崩溃保护)
+    Complete PID Controller (with Data Logging & Crash Protection)
+    """
+    # ==============================================================
+    # 0. 极限安全保护 (Extreme Safety Checks)
+    # 防止 dt=0 导致除以 0，或者传入了非法状态 (NaN)
+    # Prevent division by zero or invalid state inputs
+    # ==============================================================
+    if dt <= 1e-4:
         return (0.0, 0.0, 0.0, 0.0)
+    
+    for val in state:
+        if math.isnan(val) or math.isinf(val):
+            return (0.0, 0.0, 0.0, 0.0)
 
-    # 1. 状态解析 / Parse state
+    # 1. 状态解析 (State & Target Parsing)
     x, y, z, roll, pitch, yaw = state
     tx, ty, tz, tyaw = target_pos
 
     # ==============================================================
-    # 🌟 数据记录模块 (Data Logging Module)  [保持不变]
+    # 🌟 数据记录模块 (Data Logging Module)
     # ==============================================================
     if not hasattr(controller, "is_initialized_csv"):
         controller.buffer = []
@@ -46,79 +59,83 @@ def controller(state, target_pos, dt, wind_enabled=False):
         controller.buffer.clear()
 
     # ==============================================================
-    # 2. 初始化持久化变量 (改良版)
+    # 🚀 核心 PID 参数 (Core PID Parameters) 
+    # [可调整区域 / Tuning Area]
     # ==============================================================
-    if not hasattr(controller, 'prev_pos'):
-        controller.prev_pos = np.array([x, y, z])
-        controller.filtered_vel = np.array([0.0, 0.0, 0.0])  # 低通滤波后的速度，防震荡
-        controller.pos_integral = np.array([0.0, 0.0, 0.0])  # 外环位置积分，抗风消除稳态误差
-        controller.prev_pos_err = np.array([0.0, 0.0, 0.0])  # 上一帧位置误差
+    # Kp: 比例，控制靠近目标的速度 / Proportional, speed towards target
+    Kp_xy = 1.2
+    Kp_z = 1.0
+    Kp_yaw = 2.0
+    
+    # Ki: 积分，用来抵抗风等持续干扰 / Integral, to fight steady wind
+    Ki_xy = 0.6 if wind_enabled else 0.0
+    Ki_z = 0.5 if wind_enabled else 0.0
+    
+    # Kd: 微分，相当于刹车，防止超调 / Derivative, acts as a brake, prevents overshoot
+    Kd_xy = 0.2
+    Kd_z = 0.15
+    Kd_yaw = 0.1
 
     # ==============================================================
-    # 🌟 调参区 (Tuning Area)
+    # 初始化历史变量 (Initialize Persistent Variables)
     # ==============================================================
-    # [外环: 位置 -> 期望速度]
-    Kp_outer = np.array([1.0, 1.0, 1.2]) 
-    Ki_outer = np.array([0.4, 0.4, 0.3]) if wind_enabled else np.array([0.0, 0.0, 0.0])
-    Kd_outer = np.array([0.1, 0.1, 0.1])
-
-    # [内环: 期望速度 -> 速度指令补偿]
-    Kp_inner = np.array([0.8, 0.8, 0.8])
-    # 注：内环去掉了 D 和 I，因为外环已经做了抗风，且去掉了 D 极大地降低了震荡
+    if not hasattr(controller, 'integral_error'):
+        controller.integral_error = [0.0, 0.0, 0.0] # [x, y, z]
+    if not hasattr(controller, 'prev_error'):
+        controller.prev_error = [0.0, 0.0, 0.0, 0.0] # [x, y, z, yaw]
 
     # ==============================================================
-    # [速度估算] 使用低通滤波去噪
+    # 误差计算 (Error Calculation in World Frame)
     # ==============================================================
-    alpha = 0.3 # 滤波系数 (0~1)，越小越平滑
-    current_pos = np.array([x, y, z])
-    raw_vel = (current_pos - controller.prev_pos) / dt
-    controller.filtered_vel = (alpha * raw_vel) + ((1.0 - alpha) * controller.filtered_vel)
-
-    # ==============================================================
-    # [外环：位置环] Outer Loop: Position -> Target Velocity
-    # ==============================================================
-    pos_error = np.array([tx - x, ty - y, tz - z])
-    d_pos_err = (pos_error - controller.prev_pos_err) / dt
-
-    # 积分与抗饱和 (Anti-windup)
-    controller.pos_integral += pos_error * dt
-    controller.pos_integral = np.clip(controller.pos_integral, -1.5, 1.5)
-
-    # 计算期望速度
-    target_vel = (Kp_outer * pos_error) + (Ki_outer * controller.pos_integral) + (Kd_outer * d_pos_err)
-    target_vel = np.clip(target_vel, -1.5, 1.5) # 限制期望速度最大值
-
-    # ==============================================================
-    # [内环：速度环] Inner Loop: Velocity -> Velocity Command
-    # ==============================================================
-    vel_error = target_vel - controller.filtered_vel
-    # 前馈 (直接使用目标速度) + 比例补偿
-    v_world = target_vel + (Kp_inner * vel_error)
-
-    # ==============================================================
-    # [偏航角控制] Yaw Control (Single Loop)
-    # ==============================================================
+    ex = tx - x
+    ey = ty - y
+    ez = tz - z
+    
+    # 偏航角限制在 [-pi, pi] 之间 / Wrap yaw error to [-pi, pi]
     eyaw = tyaw - yaw
     eyaw = (eyaw + math.pi) % (2 * math.pi) - math.pi
-    yaw_rate_cmd = 2.0 * eyaw # Simple P controller for yaw
 
     # ==============================================================
-    # [坐标系转换与收尾] Frame Transformation & Cleanup
+    # P, I, D 项计算 (Calculate P, I, D terms)
     # ==============================================================
-    vx_w, vy_w, vz_w = v_world
-    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
-    
-    # World to Body
-    vx_body = vx_w * cos_yaw + vy_w * sin_yaw
-    vy_body = -vx_w * sin_yaw + vy_w * cos_yaw
-    vz_body = vz_w
+    # 微分 (Derivative)
+    dx = (ex - controller.prev_error[0]) / dt
+    dy = (ey - controller.prev_error[1]) / dt
+    dz = (ez - controller.prev_error[2]) / dt
+    dyaw = (eyaw - controller.prev_error[3]) / dt
 
-    # 更新历史状态 / Update history
-    controller.prev_pos = current_pos
-    controller.prev_pos_err = pos_error
+    # 积分与抗饱和 (Integral & Anti-Windup)
+    controller.integral_error[0] += ex * dt
+    controller.integral_error[1] += ey * dt
+    controller.integral_error[2] += ez * dt
+
+    max_integral = 2.0 # 防止积分爆炸 / Prevent integral windup
+    for i in range(3):
+        controller.integral_error[i] = max(-max_integral, min(controller.integral_error[i], max_integral))
+
+    ix, iy, iz = controller.integral_error
+
+    # 计算全局速度指令 / Compute World Frame Velocity
+    vx_world = (Kp_xy * ex) + (Ki_xy * ix) + (Kd_xy * dx)
+    vy_world = (Kp_xy * ey) + (Ki_xy * iy) + (Kd_xy * dy)
+    vz_world = (Kp_z * ez)  + (Ki_z * iz)  + (Kd_z * dz)
+    yaw_rate_cmd = (Kp_yaw * eyaw) + (Kd_yaw * dyaw)
 
     # ==============================================================
-    # 最终输出限幅与清洗 (Final Output Clamping & Cleaning) [保持不变]
+    # 坐标系转换：世界 -> 机身 (World Frame to Body Frame)
+    # ==============================================================
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+
+    vx_body = vx_world * cos_yaw + vy_world * sin_yaw
+    vy_body = -vx_world * sin_yaw + vy_world * cos_yaw
+    vz_body = vz_world 
+
+    # 保存误差供下一帧使用 / Save error for next frame
+    controller.prev_error = [ex, ey, ez, eyaw]
+
+    # ==============================================================
+    # 最终输出限幅与清洗 (Final Output Clamping & Cleaning)
     # 彻底杜绝 NaN 传给模拟器 / Absolutely prevent NaN sent to simulator
     # ==============================================================
     def clean_and_clamp(val, min_val, max_val):

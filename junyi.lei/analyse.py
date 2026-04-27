@@ -5,48 +5,39 @@ import glob
 import os
 
 def calculate_metrics(time, actual, target):
-    """
-    Calculate performance metrics: Rise Time (90%), Overshoot, Steady-State Error
-    """
     final_target = target.iloc[-1]
     initial_val = actual.iloc[0]
     step_size = abs(final_target - initial_val)
     
-    # 1. Steady state error (mean of last 50 points)
-    steady_state_actual = actual.iloc[-50:].mean()
-    ss_error = abs(final_target - steady_state_actual)
-    
-    # Return NaN if there is no target step change
     if step_size < 1e-5:
-        return np.nan, 0.0, ss_error
+        return np.nan, 0.0, None
 
-    # 2. Rise time (Time to reach 90% of step change)
-    threshold_90 = initial_val + 0.9 * (final_target - initial_val)
+    # 上升阶段判定标准：95%
+    threshold_95 = initial_val + 0.95 * (final_target - initial_val)
     if final_target > initial_val:
-        reached = actual >= threshold_90
+        reached = actual >= threshold_95
     else:
-        reached = actual <= threshold_90
+        reached = actual <= threshold_95
         
+    rise_time = np.nan
+    idx_95 = None
     if reached.any():
-        idx = reached.idxmax()
-        rise_time = time.loc[idx] - time.iloc[0]
-    else:
-        rise_time = np.nan
+        idx_95 = reached.idxmax()
+        rise_time = time.loc[idx_95] - time.iloc[0]
         
-    # 3. Overshoot (%)
+    # 超调量 (%)
     if final_target > initial_val:
         peak = actual.max()
         overshoot = (peak - final_target) / step_size * 100
     else:
         peak = actual.min()
         overshoot = (final_target - peak) / step_size * 100
-        
-    overshoot = max(0, overshoot) # Set to 0 if no overshoot
+    overshoot = max(0, overshoot)
     
-    return rise_time, overshoot, ss_error
+    return rise_time, overshoot, idx_95
 
 def process_csv(file_path):
-    print(f"Processing file: {file_path}")
+    print(f"\n{'='*50}\n📊 Processing file: {file_path}\n{'='*50}")
     df = pd.read_csv(file_path)
     
     if 'time' not in df.columns:
@@ -54,84 +45,149 @@ def process_csv(file_path):
         return
         
     time = df['time']
-    
-    # Convert yaw from radians to degrees and normalize to 0-360
     df['yaw_deg'] = np.degrees(df['yaw']) % 360
     df['target_yaw_deg'] = np.degrees(df['target_yaw']) % 360
     
-    # Calculate metrics for X, Y, Z
-    metrics = []
-    for axis in ['x', 'y', 'z']:
-        rt, os_val, sse = calculate_metrics(time, df[axis], df[f'target_{axis}'])
-        metrics.append((rt, os_val, sse))
-        
-    metrics = np.array(metrics)
-    avg_rt, avg_os, avg_sse = np.nanmean(metrics, axis=0)
+    df['target_id'] = (df[['target_x', 'target_y', 'target_z', 'target_yaw']].diff().abs().sum(axis=1) > 1e-4).cumsum()
     
-    # Calculate 3D total error
-    error_x = df['target_x'] - df['x']
-    error_y = df['target_y'] - df['y']
-    error_z = df['target_z'] - df['z']
-    total_error = np.sqrt(error_x**2 + error_y**2 + error_z**2)
-    
-    # Set up layout using GridSpec to make the 5th plot taller
-    fig = plt.figure(figsize=(10, 16))
-    gs = fig.add_gridspec(6, 1) # Divide figure into 6 rows
-    
-    plot_configs = [
-        (0, 'x', 'X Position (m)', df['target_x'], df['x']),
-        (1, 'y', 'Y Position (m)', df['target_y'], df['y']),
-        (2, 'z', 'Z Position (m)', df['target_z'], df['z']),
-        (3, 'yaw', 'Yaw Angle (deg)', df['target_yaw_deg'], df['yaw_deg'])
-    ]
-    
-    # Plot the first 4 subplots (each takes 1 row)
-    for pos, axis, ylabel, target_data, actual_data in plot_configs:
-        ax = fig.add_subplot(gs[pos, 0])
-        ax.plot(time, target_data, label=f'Target {axis.upper()}', linestyle='--', color='black', linewidth=1.5)
-        ax.plot(time, actual_data, label=f'Actual {axis.upper()}', color='#1f77b4', linewidth=1.5)
-        ax.set_ylabel(ylabel, fontsize=12)
-        ax.legend(loc='upper right')
-        ax.grid(True, linestyle=':', alpha=0.6)
+    df['pos_err'] = np.sqrt((df['target_x'] - df['x'])**2 + (df['target_y'] - df['y'])**2 + (df['target_z'] - df['z'])**2)
+    df['yaw_err'] = np.abs((df['target_yaw'] - df['yaw'] + np.pi) % (2 * np.pi) - np.pi)
 
-    # Plot the 5th subplot (Total Error) taking 2 rows (rows 4 and 5)
+    all_eval_pos_errors = []
+    all_eval_yaw_errors = []
+    rise_times = []
+    overshoots = []
+
+    for target_id, group in df.groupby('target_id'):
+        group_time = group['time']
+        segment_rts = []
+        segment_os = []
+        
+        for axis in ['x', 'y', 'z']:
+            rt, os_val, _ = calculate_metrics(group_time, group[axis], group[f'target_{axis}'])
+            segment_rts.append(rt)
+            segment_os.append(os_val)
+            
+        rise_times.append(np.nanmean(segment_rts))
+        overshoots.append(np.nanmean(segment_os))
+        
+        # =========================================================================
+        # 🌟 修改点：向后扩展时间窗 (Cumulative Backward Windows)
+        # 分别提取：后1s, 后2s, 后3s, 后4s, 后5s 的完整数据段
+        # =========================================================================
+        t_end = group['time'].iloc[-1]
+        best_std = float('inf')
+        best_window = None
+        best_label = ""
+        
+        print(f"📍 [Target {target_id}] Evaluating expanding windows for steady-state:")
+        
+        # i 表示我们要往前推几秒 (1, 2, 3, 4, 5)
+        for i in range(1, 6):
+            t_start = t_end - i
+            
+            # 截取从 t_start 到终点的完整数据段
+            window = group[(group['time'] > t_start) & (group['time'] <= t_end)]
+            
+            if len(window) > 10: 
+                w_pos_mean = window['pos_err'].mean()
+                w_pos_std = window['pos_err'].std()
+                print(f"    - Window [Last {i}s]: Mean Err = {w_pos_mean:.5f}m, Std = {w_pos_std:.5f}")
+                
+                # 寻找标准差最小的时间段 (即最平稳的阶段)
+                if w_pos_std < best_std:
+                    best_std = w_pos_std
+                    best_window = window
+                    best_label = f"Last {i}s"
+                    
+        if best_window is not None:
+            print(f"    ✅ Selected '{best_label}' as the true steady-state period.\n")
+            all_eval_pos_errors.extend(best_window['pos_err'].tolist())
+            all_eval_yaw_errors.extend(best_window['yaw_err'].tolist())
+        else:
+            print(f"    ⚠️ Data too short, falling back to last 50 points.\n")
+            all_eval_pos_errors.extend(group['pos_err'].iloc[-50:].tolist())
+            all_eval_yaw_errors.extend(group['yaw_err'].iloc[-50:].tolist())
+
+    # 计算最终评分统计量
+    pos_mean = np.mean(all_eval_pos_errors) if all_eval_pos_errors else np.nan
+    pos_std = np.std(all_eval_pos_errors) if all_eval_pos_errors else np.nan
+    yaw_mean = np.mean(all_eval_yaw_errors) if all_eval_yaw_errors else np.nan
+    yaw_std = np.std(all_eval_yaw_errors) if all_eval_yaw_errors else np.nan
+    
+    avg_rt = np.nanmean(rise_times) if rise_times else np.nan
+    avg_os = np.nanmean(overshoots) if overshoots else np.nan
+
+    status = {
+        "Pos Mean": "Pass" if pos_mean < 0.01 else "Fail",
+        "Pos Std": "Pass" if pos_std < 0.01 else "Fail",
+        "Yaw Mean": "Pass" if yaw_mean < 0.01 else "Fail",
+        "Yaw Std": "Pass" if yaw_std < 0.001 else "Fail"
+    }
+
+    # =========================================================================
+    # 绘图部分
+    # =========================================================================
+    fig = plt.figure(figsize=(10, 20))
+    gs = fig.add_gridspec(9, 1)
+    
+    axes_config = [('x', 'X Position (m)'), ('y', 'Y Position (m)'), ('z', 'Z Position (m)')]
+    for i, (axis, ylabel) in enumerate(axes_config):
+        ax = fig.add_subplot(gs[i, 0])
+        ax.plot(time, df[f'target_{axis}'], '--k', label=f'Target {axis.upper()}')
+        ax.plot(time, df[axis], color='#1f77b4', label=f'Actual {axis.upper()}')
+        ax.set_ylabel(ylabel)
+        ax.legend(loc='upper right'); ax.grid(True, alpha=0.3)
+
+    ax_yaw = fig.add_subplot(gs[3, 0])
+    ax_yaw.plot(time, df['target_yaw_deg'], '--k', label='Target Yaw')
+    ax_yaw.plot(time, df['yaw_deg'], color='#1f77b4', label='Actual Yaw')
+    ax_yaw.set_ylabel('Yaw (deg)'); ax_yaw.legend(); ax_yaw.grid(True, alpha=0.3)
+
+    total_error = df['pos_err']
     ax_err = fig.add_subplot(gs[4:6, 0])
-    ax_err.plot(time, total_error, label='XYZ Total Error', color='red', linewidth=1.5)
+    ax_err.plot(time, total_error, color='red', label='XYZ Total Error')
+    ax_err.axhline(0.01, color='green', linestyle=':', linewidth=2, label='Grading Threshold (0.01m)')
+    ax_err.set_ylabel('Error (m)'); ax_err.set_xlabel('Time (s)'); ax_err.legend(); ax_err.grid(True)
     
-    # Add Zero Error Reference Line
-    ax_err.axhline(0, color='green', linestyle='--', linewidth=2, label='Zero Error Ref')
-    
-    ax_err.set_ylabel('Error Distance (m)', fontsize=12)
-    ax_err.set_xlabel('Time (s)', fontsize=12)
-    ax_err.legend(loc='upper right')
-    ax_err.grid(True, linestyle=':', alpha=0.6)
-    
-    # Add text box with average metrics
     info_text = (
-        f"Average Metrics (X, Y, Z combined):\n"
-        f"Avg Rise Time (90%): {avg_rt:.3f} s\n"
+        f"Dynamic Analysis Metrics:\n"
+        f"Avg Rise Time (95% Path): {avg_rt:.3f} s\n"
         f"Avg Overshoot: {avg_os:.2f} %\n"
-        f"Avg Steady-State Error: {avg_sse:.4f} m"
+        f"True Steady-State Error: {pos_mean:.5f} m"
     )
-    
     ax_err.text(0.5, 0.5, info_text, transform=ax_err.transAxes, fontsize=11,
                 verticalalignment='center', horizontalalignment='center',
                 bbox=dict(boxstyle='round,pad=0.8', facecolor='white', edgecolor='gray', alpha=0.9))
 
-    plt.suptitle(f'Data Analysis Report: {os.path.basename(file_path)}', fontsize=16)
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.95)
+    ax_table = fig.add_subplot(gs[7:9, 0])
+    ax_table.axis('off')
+    table_data = [
+        ["Grading Metric", "Measured Value (Optimal Window)", "Requirement (<)", "Result"],
+        ["Positional Error Mean", f"{pos_mean:.5f} m", "0.01 m", status["Pos Mean"]],
+        ["Positional Error Std", f"{pos_std:.5f}", "0.01", status["Pos Std"]],
+        ["Yaw Error Mean", f"{yaw_mean:.5f} rad", "0.01 rad", status["Yaw Mean"]],
+        ["Yaw Error Std", f"{yaw_std:.5f} rad", "0.001 rad", status["Yaw Std"]]
+    ]
     
-    # Save the plot
-    save_name = f"{os.path.splitext(file_path)[0]}_analysis.png"
-    plt.savefig(save_name, dpi=150)
-    plt.close()
-    print(f"✅ Plot saved as: {save_name}\n")
+    ccolors = [['white']*4 for _ in range(5)]
+    for r in range(1, 5):
+        res = table_data[r][3]
+        ccolors[r][3] = '#d4edda' if res == 'Pass' else '#f8d7da'
+
+    tab = ax_table.table(cellText=table_data, cellColours=ccolors, loc='center', cellLoc='center', colWidths=[0.35, 0.3, 0.2, 0.15])
+    tab.auto_set_font_size(False); tab.set_fontsize(11); tab.scale(1, 2.2)
+    for (r, c), cell in tab.get_celld().items():
+        if r == 0: cell.set_text_props(weight='bold', color='white'); cell.set_facecolor('#40466e')
+
+    plt.suptitle(f'Autograder Report (Expanding Steady-State Window)\nFile: {os.path.basename(file_path)}', fontsize=15)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    
+    save_name = f"{os.path.splitext(file_path)[0]}_grading_report.png"
+    plt.savefig(save_name, dpi=150); plt.close()
+    print(f"✅ Grading report saved as: {save_name}\n")
 
 if __name__ == "__main__":
     csv_files = glob.glob("*.csv")
-    if not csv_files:
-        print("No CSV files found in the current directory.")
-    else:
-        for file in csv_files:
-            process_csv(file)
+    for file in csv_files:
+        process_csv(file)

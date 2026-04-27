@@ -13,12 +13,41 @@ def controller(state, target_pos, dt, wind_enabled=False):
 
     pos_error = np.array([tx - x, ty - y, tz - z])
 
-    # 应对风力的稳态积分 / Integral for steady-state wind
-    if wind_enabled:
-        controller.integral_err += pos_error * dt
-        controller.integral_err = np.clip(controller.integral_err, -2.0, 2.0)
-    else:
-        controller.integral_err = np.array([0.0, 0.0, 0.0])
+    # ==============================================================
+    # 🌟 数据记录模块 (Data Logging Module)
+    # ==============================================================
+    if not hasattr(controller, "is_initialized_csv"):
+        controller.buffer = []
+        controller.buffer_limit = 50     # 每50帧写入一次磁盘
+        controller.file_path = "data_mpc.csv"
+        controller.sim_time = 0.0
+        
+        # 优化点：不再检查文件是否存在，而是直接用 'w' 模式打开。
+        # 这会自动清空旧的 data.csv 并写入全新的表头。
+        with open(controller.file_path, 'w') as f:
+            f.write("time,target_x,target_y,target_z,target_yaw,x,y,z,yaw\n")
+        
+        # 退出时保存缓冲区剩余数据
+        def flush_buffer():
+            if hasattr(controller, "buffer") and controller.buffer:
+                with open(controller.file_path, 'a') as f:
+                    f.writelines(controller.buffer)
+        
+        import atexit
+        atexit.register(flush_buffer)
+        controller.is_initialized_csv = True
+
+    # 累加时间并记录
+    controller.sim_time += dt
+    # 使用字符串格式化确保数据整齐
+    record = f"{controller.sim_time:.4f},{tx:.4f},{ty:.4f},{tz:.4f},{tyaw:.4f},{x:.4f},{y:.4f},{z:.4f},{yaw:.4f}\n"
+    controller.buffer.append(record)
+
+    # 达到阈值时追加写入磁盘 (使用 'a' 模式)
+    if len(controller.buffer) >= controller.buffer_limit:
+        with open(controller.file_path, 'a') as f:
+            f.writelines(controller.buffer)
+        controller.buffer.clear()
 
     # ==============================================================
     # 极简离散解析 MPC (预测期 N=3) / Simplified Analytical MPC (Horizon N=3)
@@ -26,8 +55,8 @@ def controller(state, target_pos, dt, wind_enabled=False):
     # 此处假设控制输入 u 就是速度，所以位置 p(k+1) = p(k) + u*dt
     # ==============================================================
     # 权重矩阵 / Weighting matrices
-    Q = 10.0  # State cost (惩罚位置误差)
-    R = 1.0   # Input cost (惩罚剧烈运动)
+    Q = 5.0  # State cost (惩罚位置误差)
+    R = 2.0   # Input cost (惩罚剧烈运动)
     
     # 由于系统是线性独立的解耦轴，我们对单个轴计算最优预测增益 (Unconstrained Solution)
     # 对于模型 p(k+1) = p(k) + u*dt，预测矩阵 H 和 P 可以被提取。
@@ -35,8 +64,9 @@ def controller(state, target_pos, dt, wind_enabled=False):
     # optimal_u = [ (H^T Q H + R)^-1 H^T Q ] * Error
     
     # 预测矩阵构建 (N=3) / Prediction Matrices construction
-    H = np.array([[dt], [2*dt], [3*dt]])
-    Q_mat = np.eye(3) * Q
+    N = 5
+    H = np.array([[dt * (i+1)] for i in range(N)])   # [dt, 2dt, ..., N*dt]
+    Q_mat = np.eye(N) * Q
     
     # 核心矩阵运算: K_mpc = (H^T * Q * H + R)^-1 * H^T * Q
     # Matrix operations using raw numpy

@@ -1,17 +1,8 @@
 import numpy as np
 import math
-import os
-import atexit
-import matplotlib as mpl
+
 
 def controller(state, target_pos, dt, wind_enabled=False):
-    # ==============================================================
-    # 0. Ultimate anti-crash patch and bottom-line safety protection
-    # ==============================================================
-    if not hasattr(controller, 'hotkey_fixed'):
-        if 'k' in mpl.rcParams['keymap.xscale']: mpl.rcParams['keymap.xscale'].remove('k')
-        if 'l' in mpl.rcParams['keymap.yscale']: mpl.rcParams['keymap.yscale'].remove('l')
-        controller.hotkey_fixed = True
 
     if dt <= 1e-5:
         return (0.0, 0.0, 0.0, 0.0)
